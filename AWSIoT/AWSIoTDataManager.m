@@ -37,6 +37,22 @@
 }
 @end
 
+// needed to override JSONKeyPathsByPropertyKey
+@interface AWSIoTDataShadowDocumentUpdateModel : AWSIoTDataShadowModel
+
+@end
+
+@implementation AWSIoTDataShadowDocumentUpdateModel
++ (NSDictionary *)JSONKeyPathsByPropertyKey {
+    NSMutableDictionary *paths = [[super JSONKeyPathsByPropertyKey] mutableCopy];
+    
+    paths[@"clientToken"] = @"clientToken";
+    paths[@"version"] = @"current.version";
+    
+    return paths;
+}
+@end
+
 @interface AWSIoTDataShadow:NSObject
 //
 // Each shadow has the following properties
@@ -47,7 +63,9 @@
 @property(atomic, assign) BOOL enableForeignStateUpdateNotifications;
 @property(atomic, assign) BOOL enableStaleDiscards;
 @property(atomic, assign) BOOL enableIgnoreDeltas;
+@property(atomic, assign) BOOL enableUpdateDocumentsSubscription;
 @property(atomic, assign) UInt32 version;
+@property(atomic, assign) UInt32 documentVersion; // Used for update/documents topic separate version tracking
 @property(nonatomic, strong) NSString *clientToken;
 @property(atomic, assign) AWSIoTMQTTQoS qos;
 @property(nonatomic, strong) NSMutableArray* topics;
@@ -71,6 +89,7 @@
                    versioned:(BOOL)enableVersioning
          discardStaleUpdates:(BOOL)enableStaleDiscards
                discardDeltas:(BOOL)enableIgnoreDeltas
+             updateDocuments:(BOOL)enableUpdateDocumentsSubscription
       updateOnForeignChanges:(BOOL)enableForeignStateUpdateNotifications
             operationTimeout:(NSTimeInterval)operationTimeoutSeconds
                          QoS:(AWSIoTMQTTQoS)qos
@@ -82,11 +101,13 @@
         _enableVersioning = enableVersioning;
         _enableStaleDiscards = enableStaleDiscards;
         _enableIgnoreDeltas = enableIgnoreDeltas;
+        _enableUpdateDocumentsSubscription = enableUpdateDocumentsSubscription;
         _enableForeignStateUpdateNotifications = enableForeignStateUpdateNotifications;
         _callback = callback;
         _operationTimeout = operationTimeoutSeconds;
         _qos = qos;
         _version = 0;
+        _documentVersion = 0;
         _topics = [NSMutableArray new];
         _timer = nil;
         _clientToken = nil;
@@ -405,7 +426,8 @@ static NSString * const AWSIoTShadowOperationTypeStrings[] = {
 static NSString * const AWSIoTShadowOperationStatusTypeStrings[] = {
     @"accepted",     // AWSIoTShadowOperationStatusTypeAccepted
     @"rejected",     // AWSIoTShadowOperationStatusTypeRejected
-    @"delta"         // AWSIoTShadowOperationStatusTypeDelta
+    @"delta",        // AWSIoTShadowOperationStatusTypeDelta
+    @"documents"     // AWSIoTShadowOperationStatusTypeDocuments
 };
 
 + (NSArray *)operationTypeStrings {
@@ -522,7 +544,10 @@ static NSString * const AWSIoTShadowOperationStatusTypeStrings[] = {
     
     if (error == nil) {
         NSError *error;
-        AWSIoTDataShadowModel *shadowModel = [AWSMTLJSONAdapter modelOfClass:AWSIoTDataShadowModel.class fromJSONDictionary:jsonDictionary error:&error];
+        
+        Class shadowModelClass = (status == AWSIoTShadowOperationStatusTypeDocuments) ? AWSIoTDataShadowDocumentUpdateModel.class : AWSIoTDataShadowModel.class;
+        AWSIoTDataShadowModel *shadowModel = [AWSMTLJSONAdapter modelOfClass:shadowModelClass fromJSONDictionary:jsonDictionary error:&error];
+
         //
         // Update the thing version on every accepted or delta message which
         // contains it.
@@ -531,15 +556,19 @@ static NSString * const AWSIoTShadowOperationStatusTypeStrings[] = {
             AWSIoTDataShadow *shadow = [self.shadows objectForKey:name];
 
             rc = YES;
-            if ((shadowModel.version != nil) && (status != AWSIoTShadowOperationStatusTypeRejected)) {
+            if (shadowModel.version != nil) {
                 UInt32 versionNumber = (UInt32)[shadowModel.version integerValue];
+                
                 //
                 // The shadow version is incremented by AWS IoT and should always increase.
                 // Do not update our local version if the received version is less than
                 // our version.
                 //
-                if(versionNumber >= shadow.version) {
+                if ((status != AWSIoTShadowOperationStatusTypeDocuments) && (versionNumber >= shadow.documentVersion)) {
                     shadow.version = versionNumber;
+                }
+                else if ((status == AWSIoTShadowOperationStatusTypeDocuments) && (versionNumber >= shadow.version)) {
+                    shadow.documentVersion = versionNumber;
                 }
                 else {
                     //
@@ -556,17 +585,23 @@ static NSString * const AWSIoTShadowOperationStatusTypeStrings[] = {
                     //
                     if (operation != AWSIoTShadowOperationTypeDelete && shadow.enableStaleDiscards == YES) {
                         if (shadow.enableDebugging == YES) {
-                            AWSDDLogInfo(@"out-of-date version '%u' on '%@' (local version '%u')", (unsigned int)versionNumber, name, (unsigned int)shadow.version);
+                            if (status == AWSIoTShadowOperationStatusTypeDocuments) {
+                                AWSDDLogInfo(@"out-of-date update/documents version '%u' on '%@' (local version '%u')", (unsigned int)versionNumber, name, (unsigned int)shadow.documentVersion);
+                            }
+                            else {
+                                AWSDDLogInfo(@"out-of-date version '%u' on '%@' (local version '%u')", (unsigned int)versionNumber, name, (unsigned int)shadow.version);
+                            }
                         }
                         rc = NO;
                     }
                 }
             }
+            
             if (rc == YES) {
                 //
-                // If this is a 'delta' message, call the user's callback
+                // If this is a 'delta' or 'documents' message, call the user's callback
                 //
-                if (status == AWSIoTShadowOperationStatusTypeDelta) {
+                if ((status == AWSIoTShadowOperationStatusTypeDelta) || (status == AWSIoTShadowOperationStatusTypeDocuments)) {
                     shadow.callback( shadow.name, operation, status, shadow.clientToken, payload );
                 }
                 else {
@@ -762,7 +797,7 @@ static void (^shadowMqttMessageHandler)(NSObject *mqttClient, NSString *topic, N
         // This shadow has not yet been registered; create a new shadow with
         // default options.
         //
-        shadow = [[AWSIoTDataShadow alloc] initWithName:name debug:NO versioned:NO discardStaleUpdates:YES discardDeltas:NO updateOnForeignChanges:NO operationTimeout:10.0 QoS:AWSIoTMQTTQoSMessageDeliveryAttemptedAtMostOnce callback:callback];
+        shadow = [[AWSIoTDataShadow alloc] initWithName:name debug:NO versioned:NO discardStaleUpdates:YES discardDeltas:NO updateDocuments:NO updateOnForeignChanges:NO operationTimeout:10.0 QoS:AWSIoTMQTTQoSMessageDeliveryAttemptedAtMostOnce callback:callback];
         
         if (shadow != nil) {
             //
@@ -794,6 +829,10 @@ static void (^shadowMqttMessageHandler)(NSObject *mqttClient, NSString *topic, N
                 if (numberOptionValue != nil) {
                     shadow.enableIgnoreDeltas = [numberOptionValue integerValue];
                 }
+                numberOptionValue = [options valueForKey:@"enableUpdateDocumentsSubscription"];
+                if (numberOptionValue != nil) {
+                    shadow.enableUpdateDocumentsSubscription = [numberOptionValue integerValue];
+                }
                 numberOptionValue = [options valueForKey:@"QoS"];
                 if (numberOptionValue != nil) {
                     shadow.qos = [numberOptionValue integerValue];
@@ -806,11 +845,17 @@ static void (^shadowMqttMessageHandler)(NSObject *mqttClient, NSString *topic, N
             if (shadow.enableIgnoreDeltas == NO) {
                 rc = [self handleSubscriptionsForShadow:shadow.name operations:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationTypeUpdate], nil] statii:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeDelta], nil] callback:shadowMqttMessageHandler];
             }
+            
             if (rc == YES) {
                 //
                 // Persistently subscribe to the special topics for this shadow.
                 //
-                rc = [self handleSubscriptionsForShadow:shadow.name operations:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationTypeUpdate], [NSNumber numberWithInteger:AWSIoTShadowOperationTypeGet], [NSNumber numberWithInteger:AWSIoTShadowOperationTypeDelete], nil] statii:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeAccepted], [NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeRejected], nil] callback:shadowMqttMessageHandler];
+                rc = [self handleSubscriptionsForShadow:shadow.name operations:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationTypeUpdate], [NSNumber numberWithInteger:AWSIoTShadowOperationTypeGet], [NSNumber numberWithInteger:AWSIoTShadowOperationTypeDelete], nil] statii:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeAccepted], [NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeRejected], [NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeDocuments], nil] callback:shadowMqttMessageHandler];
+                
+                // Subscribe to update/documents if needed
+                if ((rc == YES) && (shadow.enableUpdateDocumentsSubscription == YES)) {
+                    rc = [self handleSubscriptionsForShadow:shadow.name operations:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationTypeUpdate], nil] statii:[NSArray arrayWithObjects:[NSNumber numberWithInteger:AWSIoTShadowOperationStatusTypeDocuments], nil] callback:shadowMqttMessageHandler];
+                }
             }
             else {
                 AWSDDLogError(@"unable to subscribe to delta topic for (%@)", name);
